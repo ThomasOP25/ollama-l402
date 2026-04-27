@@ -38,6 +38,10 @@ limiter = Limiter(key_func=get_remote_address)
 AVAILABLE_MODELS: dict[str, int] = {}
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
 
+# Cached probe invoice so daily directory health checks don't spam NWC
+_probe_cache: dict = {"invoice": None, "payment_hash": None, "expires": 0}
+PROBE_CACHE_TTL = 1800  # 30 minutes
+
 
 def _hash_to_token(payment_hash_hex: str) -> str:
     return base64.b64encode(bytes.fromhex(payment_hash_hex)).decode()
@@ -226,3 +230,66 @@ async def complete(request: Request):
             )
 
     return Response(content=resp.content, media_type="application/json")
+
+
+@app.get("/")
+@limiter.limit("30/minute")
+async def probe(request: Request):
+    """Directory health-check endpoint — returns 402 with a cached invoice."""
+    global _probe_cache
+    db: aiosqlite.Connection = request.app.state.db
+    model = DEFAULT_MODEL
+    price_sats = AVAILABLE_MODELS.get(model, MODEL_PRICING.get(model, 5))
+
+    if time.time() > _probe_cache["expires"]:
+        invoice_resp = await nwc.make_invoice(
+            MakeInvoiceRequest(
+                amount=price_sats * 1000,
+                description=f"Ollama inference ({model})",
+                description_hash=None,
+                expiry=INVOICE_EXPIRY,
+            )
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO pending_payments VALUES (?, ?, ?)",
+            (invoice_resp.payment_hash, model, time.time()),
+        )
+        await db.commit()
+        _probe_cache = {
+            "invoice": invoice_resp.invoice,
+            "payment_hash": invoice_resp.payment_hash,
+            "expires": time.time() + PROBE_CACHE_TTL,
+        }
+
+    return JSONResponse(
+        status_code=402,
+        content={
+            "invoice": _probe_cache["invoice"],
+            "payment_hash": _probe_cache["payment_hash"],
+            "model": model,
+            "price_sats": price_sats,
+            "info": "POST to /complete with {model, messages} to get a fresh invoice",
+        },
+        headers={
+            "WWW-Authenticate": (
+                f'L402 token="{_hash_to_token(_probe_cache["payment_hash"])}",'
+                f' invoice="{_probe_cache["invoice"]}"'
+            )
+        },
+    )
+
+
+@app.get("/.well-known/satring-verify")
+async def satring_verify():
+    token_file = Path(__file__).parent / "satring-verify.txt"
+    if not token_file.exists():
+        return Response(status_code=404)
+    return Response(content=token_file.read_text().strip(), media_type="text/plain")
+
+
+@app.get("/.well-known/402index-verify.txt")
+async def index_verify():
+    token_file = Path(__file__).parent / "402index-verify.txt"
+    if not token_file.exists():
+        return Response(status_code=404)
+    return Response(content=token_file.read_text().strip(), media_type="text/plain")
