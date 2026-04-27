@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
@@ -25,6 +26,16 @@ AVAILABLE_MODELS: dict[str, int] = {}
 # payment_hash -> (model, created_at): cleared after use or expiry.
 _pending_payments: dict[str, tuple[str, float]] = {}
 _spent_hashes: set[str] = set()
+
+
+def _hash_to_token(payment_hash_hex: str) -> str:
+    """Encode a payment_hash hex string as a base64 token for L402 headers."""
+    return base64.b64encode(bytes.fromhex(payment_hash_hex)).decode()
+
+
+def _token_to_hash(token: str) -> str:
+    """Decode a base64 L402 token back to a payment_hash hex string."""
+    return base64.b64decode(token).hex()
 
 
 async def _cleanup_expired_pending():
@@ -54,6 +65,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/models")
+async def models():
+    """Public endpoint: list available models and pricing. No payment required."""
+    return {
+        "models": [{"name": m, "price_sats": p} for m, p in AVAILABLE_MODELS.items()],
+        "default_model": DEFAULT_MODEL,
+    }
 
 
 @app.get("/info")
@@ -92,7 +112,7 @@ async def complete(request: Request):
                 expiry=INVOICE_EXPIRY,
             )
         )
-        _pending_payments[invoice_resp.payment_hash] = (requested_model, time.time())
+        token = _hash_to_token(invoice_resp.payment_hash)
         return JSONResponse(
             status_code=402,
             content={
@@ -101,10 +121,24 @@ async def complete(request: Request):
                 "model": requested_model,
                 "price_sats": price_sats,
             },
-            headers={"WWW-Authenticate": f'L402 invoice="{invoice_resp.invoice}"'},
+            headers={
+                "WWW-Authenticate": f'L402 token="{token}", invoice="{invoice_resp.invoice}"',
+            },
         )
 
-    payment_hash = auth.removeprefix("L402 ").split(":")[0]
+    # Parse Authorization: L402 <token>:<preimage>  or legacy  L402 <payment_hash>
+    credential = auth.removeprefix("L402 ").strip()
+
+    if ":" in credential:
+        # Spec-compliant: L402 <token>:<preimage>
+        token_part, preimage_part = credential.split(":", 1)
+        try:
+            payment_hash = _token_to_hash(token_part)
+        except Exception:
+            return JSONResponse(status_code=401, content={"error": "Invalid token encoding"})
+    else:
+        # Legacy fallback: L402 <payment_hash_hex>
+        payment_hash = credential
 
     if payment_hash in _spent_hashes:
         return JSONResponse(status_code=401, content={"error": "Payment already used"})
@@ -131,6 +165,23 @@ async def complete(request: Request):
         )
         if not lookup.settled_at:
             return JSONResponse(status_code=402, content={"error": "Invoice not paid"})
+
+        # L402 spec: verify preimage proof if provided via token:preimage format.
+        # The nostr_sdk LookupInvoiceResponse exposes a `preimage` field after
+        # settlement in most NWC implementations. If available, we verify it
+        # matches what the client supplied — this proves the client actually
+        # paid (preimage is only revealed after settlement).
+        #
+        # TODO: If nostr_sdk doesn't reliably expose lookup.preimage for all
+        # NWC providers, the preimage check silently degrades to a trust-on-
+        # payment_hash model. This is a known deviation from the L402 spec.
+        # The payment_hash approach is still replay-resistant due to the
+        # _spent_hashes set, but a preimage is cryptographically stronger
+        # proof of payment.
+        if ":" in credential:
+            lookup_preimage = getattr(lookup, "preimage", None)
+            if lookup_preimage and lookup_preimage != preimage_part:
+                return JSONResponse(status_code=401, content={"error": "Preimage mismatch"})
     except Exception:
         return JSONResponse(status_code=401, content={"error": "Payment verification failed"})
 
@@ -141,10 +192,38 @@ async def complete(request: Request):
     if not messages or not isinstance(messages, list):
         return JSONResponse(status_code=400, content={"error": "messages array required"})
 
+    # Determine streaming mode: query param overrides body default
+    stream = body.get("stream", True)
+    if request.query_params.get("stream") == "false":
+        stream = False
+
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
             json={"model": paid_model, "messages": messages},
         )
+
+    if not stream:
+        # Collect all Ollama NDJSON chunks into a single response
+        full_content = []
+        model_name = paid_model
+        for line in resp.text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                import json as _json
+                chunk = _json.loads(line)
+                if chunk.get("message", {}).get("content"):
+                    full_content.append(chunk["message"]["content"])
+                if chunk.get("model"):
+                    model_name = chunk["model"]
+            except Exception:
+                pass
+        return JSONResponse(content={
+            "model": model_name,
+            "content": "".join(full_content),
+            "done": True,
+        })
 
     return Response(content=resp.content, media_type="application/json")
