@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import time
 from contextlib import asynccontextmanager
@@ -36,6 +37,10 @@ limiter = Limiter(key_func=get_remote_address)
 
 AVAILABLE_MODELS: dict[str, int] = {}
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
+
+
+def _hash_to_token(payment_hash_hex: str) -> str:
+    return base64.b64encode(bytes.fromhex(payment_hash_hex)).decode()
 
 
 def _verify_preimage(preimage_hex: str, payment_hash_hex: str) -> bool:
@@ -98,6 +103,15 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
+@app.get("/models")
+@limiter.limit("60/minute")
+async def models(request: Request):
+    return {
+        "models": [{"name": m, "price_sats": p} for m, p in AVAILABLE_MODELS.items()],
+        "default_model": DEFAULT_MODEL,
+    }
+
+
 @app.get("/info")
 @limiter.limit("60/minute")
 async def info(request: Request):
@@ -153,7 +167,7 @@ async def complete(request: Request):
                 "model": requested_model,
                 "price_sats": price_sats,
             },
-            headers={"WWW-Authenticate": f'L402 invoice="{invoice_resp.invoice}"'},
+            headers={"WWW-Authenticate": f'L402 token="{_hash_to_token(invoice_resp.payment_hash)}", invoice="{invoice_resp.invoice}"'},
         )
 
     # --- Authenticated: verify preimage ---
