@@ -1,0 +1,4 @@
+fastapi==0.136.1
+httpx==0.28.1
+nostr-sdk==0.44.2
+uvicorn==0.46.0
