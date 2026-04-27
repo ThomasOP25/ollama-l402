@@ -1,11 +1,12 @@
 import asyncio
+import hashlib
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 import httpx
 import os
-from nostr_sdk import NostrWalletConnectUri, Nwc, MakeInvoiceRequest, LookupInvoiceRequest
+from nostr_sdk import NostrWalletConnectUri, Nwc, MakeInvoiceRequest
 
 OLLAMA_URL = "http://localhost:11434"
 NWC_URI = os.environ["NWC_URI"]
@@ -27,10 +28,18 @@ _pending_payments: dict[str, tuple[str, float]] = {}
 _spent_hashes: set[str] = set()
 
 
+def _verify_preimage(preimage_hex: str, payment_hash_hex: str) -> bool:
+    """Cryptographic proof of Lightning payment: sha256(preimage) == payment_hash."""
+    try:
+        preimage_bytes = bytes.fromhex(preimage_hex)
+        return hashlib.sha256(preimage_bytes).hexdigest() == payment_hash_hex
+    except Exception:
+        return False
+
+
 async def _cleanup_expired_pending():
-    """Periodically remove pending payment entries older than invoice expiry."""
     while True:
-        await asyncio.sleep(600)  # run every 10 minutes
+        await asyncio.sleep(600)
         cutoff = time.time() - INVOICE_EXPIRY
         expired = [h for h, (_, ts) in _pending_payments.items() if ts < cutoff]
         for h in expired:
@@ -62,6 +71,7 @@ async def info():
         "models": AVAILABLE_MODELS,
         "default_model": DEFAULT_MODEL,
         "protocol": "L402",
+        "auth_format": "L402 <payment_hash>:<preimage>",
     }
 
 
@@ -71,6 +81,7 @@ async def complete(request: Request):
     if content_length and int(content_length) > MAX_BODY_BYTES:
         return JSONResponse(status_code=413, content={"error": "Request body too large"})
 
+    stream = request.query_params.get("stream", "true").lower() != "false"
     body = await request.json()
     requested_model = body.get("model", DEFAULT_MODEL)
 
@@ -104,7 +115,14 @@ async def complete(request: Request):
             headers={"WWW-Authenticate": f'L402 invoice="{invoice_resp.invoice}"'},
         )
 
-    payment_hash = auth.removeprefix("L402 ").split(":")[0]
+    # Parse L402 <payment_hash>:<preimage>
+    parts = auth.removeprefix("L402 ").split(":")
+    if len(parts) != 2:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid Authorization format. Expected: L402 <payment_hash>:<preimage>"},
+        )
+    payment_hash, preimage = parts
 
     if payment_hash in _spent_hashes:
         return JSONResponse(status_code=401, content={"error": "Payment already used"})
@@ -125,14 +143,9 @@ async def complete(request: Request):
             content={"error": f"Model mismatch: paid for '{paid_model}', requesting '{requested_model}'"},
         )
 
-    try:
-        lookup = await nwc.lookup_invoice(
-            LookupInvoiceRequest(payment_hash=payment_hash, invoice=None)
-        )
-        if not lookup.settled_at:
-            return JSONResponse(status_code=402, content={"error": "Invoice not paid"})
-    except Exception:
-        return JSONResponse(status_code=401, content={"error": "Payment verification failed"})
+    # Cryptographic proof: sha256(preimage) == payment_hash. No NWC round-trip needed.
+    if not _verify_preimage(preimage, payment_hash):
+        return JSONResponse(status_code=401, content={"error": "Invalid preimage"})
 
     _spent_hashes.add(payment_hash)
     del _pending_payments[payment_hash]
@@ -144,7 +157,7 @@ async def complete(request: Request):
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/chat",
-            json={"model": paid_model, "messages": messages},
+            json={"model": paid_model, "messages": messages, "stream": stream},
         )
 
     return Response(content=resp.content, media_type="application/json")
