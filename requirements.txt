@@ -1,4 +1,5 @@
 fastapi==0.136.1
 httpx==0.28.1
 nostr-sdk==0.44.2
+slowapi==0.1.9
 uvicorn==0.46.0
